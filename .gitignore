@@ -1,4 +1,5 @@
 /bin/
+/dist/
 *.tfstate
 *.tfstate.*
 .terraform/

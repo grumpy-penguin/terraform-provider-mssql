@@ -327,11 +327,53 @@ pipeline provides:
 | `database`  | if not set on the provider             | yes            | Target database. Overrides the provider's `database`.                                           |
 | `roles`     | yes                                    | no             | Set of database role names this user should belong to.                                          |
 
+## Releasing
+
+Terraform never builds a provider from source — `terraform init` only
+ever downloads a pre-built, versioned, checksummed binary, either from a
+registry implementing the [Terraform Registry
+Protocol](https://developer.hashicorp.com/terraform/internals/provider-registry-protocol)
+or from a local plugin directory/mirror. So getting this onto the public
+registry (so `source = "grumpy-penguin/mssql"` works for anyone) means
+publishing a release there, which itself requires GPG-signed release
+artifacts in a specific layout.
+
+[`.goreleaser.yml`](.goreleaser.yml) and
+[`.github/workflows/release.yml`](.github/workflows/release.yml) automate
+that: pushing a `vX.Y.Z` tag builds binaries for every OS/arch Terraform
+supports, zips them, generates a `SHA256SUMS` file, GPG-signs it, and
+attaches everything — plus
+[`terraform-registry-manifest.json`](terraform-registry-manifest.json),
+which declares the protocol version (6) this provider speaks — to a
+GitHub Release.
+
+One-time setup before the first tag (not something this repo can do for
+itself):
+
+1. Generate a GPG key (`gpg --full-generate-key`) dedicated to signing
+   releases, and add its private key and passphrase to the repo as the
+   `GPG_PRIVATE_KEY` / `PASSPHRASE` Actions secrets (Settings → Secrets
+   and variables → Actions).
+2. Sign in to the [Terraform
+   Registry](https://registry.terraform.io/sign-in) with the GitHub
+   account that owns this repo, add the same GPG public key under your
+   registry account's GPG keys, then use "Publish → Provider" to connect
+   this repo. The registry listens for new GitHub Releases matching
+   `vX.Y.Z` and picks them up automatically from then on.
+
+After that, releasing is just:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Status
 
 Initial iteration. Scoped to Azure SQL Database, authenticating via an
 Azure AD App Registration (client secret or OIDC workload identity
-federation). Not yet published to any registry.
+federation). Release pipeline is in place; not yet published to the
+registry — see [Releasing](#releasing).
 
 ## Development
 
