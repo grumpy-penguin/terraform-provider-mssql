@@ -1,21 +1,197 @@
 name: release
 
+# - pull_request (opened/updated): build, vet and test, then a GoReleaser snapshot build to prove
+#   every platform still compiles and the release config is valid. Nothing is signed or published.
+# - pull_request merged into main: release automatically. The version is the latest vX.Y.Z tag
+#   bumped by patch, or by minor/major when the PR has a release:minor / release:major label.
+#   A release:skip label merges without releasing (e.g. docs-only changes).
+# - workflow_dispatch: release from main on demand, bumping by the chosen part or using an
+#   explicit version.
+# - push of a v* tag: release a tag created by hand with git.
+#
+# Don't create releases in the GitHub UI: the Terraform Registry ingests a release as soon as it's
+# published, and a UI-created release has no assets yet ("Missing SHASUMS file", "Missing
+# platforms"). Every path here builds a draft release, checks all registry assets are attached,
+# and only then publishes it.
+#
+# A tag pushed with this workflow's GITHUB_TOKEN doesn't start another workflow run, so the merge
+# and dispatch paths publish in the same run rather than relying on the tag trigger.
+
 on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Part of the latest version to increment"
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      version:
+        description: "Explicit version, e.g. v1.0.0 (overrides bump; leave empty to bump)"
+        required: false
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+# PR checks for the same PR cancel each other; every release path shares one queue so two
+# releases never compute the same next version.
+concurrency:
+  group: ${{ (github.event_name == 'pull_request' && github.event.action != 'closed') && format('checks-{0}', github.ref) || 'release-publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
 
 jobs:
-  goreleaser:
+  test:
+    # Skip PRs closed without merging; a merged PR is tested again on its merge commit.
+    if: github.event_name != 'pull_request' || github.event.action != 'closed' || github.event.pull_request.merged
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merged && github.event.pull_request.merge_commit_sha || '' }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  snapshot:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    needs:
+      - test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Check GoReleaser config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: check
+
+      # Signing needs the release GPG key, which pull requests don't get.
+      - name: Snapshot build
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --snapshot --clean --skip=sign
+
+  release:
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'closed' && github.event.pull_request.merged && !contains(github.event.pull_request.labels.*.name, 'release:skip'))
+    needs:
+      - test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merged && github.event.pull_request.merge_commit_sha || '' }}
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            version="$TAG_NAME"
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            version="$INPUT_VERSION"
+          else
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              bump="$INPUT_BUMP"
+            elif [[ ",$PR_LABELS," == *",release:major,"* ]]; then
+              bump=major
+            elif [[ ",$PR_LABELS," == *",release:minor,"* ]]; then
+              bump=minor
+            else
+              bump=patch
+            fi
+
+            # Strict vX.Y.Z only, so pre-release tags like v1.0.0-rc1 are never bumped from.
+            latest="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            major="${major:-0}" minor="${minor:-0}" patch="${patch:-0}"
+            case "$bump" in
+              major) version="v$((major + 1)).0.0" ;;
+              minor) version="v${major}.$((minor + 1)).0" ;;
+              *)     version="v${major}.${minor}.$((patch + 1))" ;;
+            esac
+            echo "Latest tag: ${latest:-none}; bumping $bump"
+          fi
+
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version must look like v1.2.3 (got '$version')."
+            exit 1
+          fi
+          echo "Releasing $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create release tag
+        if: github.event_name != 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases can only be created from main (this run is on $GITHUB_REF)."
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::Tag $VERSION already exists."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -29,6 +205,7 @@ jobs:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.PASSPHRASE }}
 
+      # Creates a draft release (see .goreleaser.yml), so the registry can't see it yet.
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -36,3 +213,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+
+      - name: Verify registry assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          number="${VERSION#v}"
+          prefix="terraform-provider-mssql_${number}"
+          assets="$(gh release view "$VERSION" --json assets --jq '.assets[].name')"
+          echo "$assets"
+
+          missing=0
+          for required in "${prefix}_SHA256SUMS" "${prefix}_SHA256SUMS.sig" "${prefix}_manifest.json"; do
+            if ! grep -qx "$required" <<< "$assets"; then
+              echo "::error::Release $VERSION is missing $required."
+              missing=1
+            fi
+          done
+          if ! grep -q "^${prefix}_.*\.zip$" <<< "$assets"; then
+            echo "::error::Release $VERSION has no platform zips."
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Publish release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release edit "$VERSION" --draft=false --latest

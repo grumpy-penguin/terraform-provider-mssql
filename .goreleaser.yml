@@ -54,6 +54,12 @@ signs:
       - "${artifact}"
 
 release:
+  # The Terraform Registry ingests a release the moment it's published, so a release published
+  # before its assets finish uploading fails with "Missing SHASUMS file / signature / platforms".
+  # GoReleaser creates a draft instead; the release workflow verifies every asset is attached and
+  # only then publishes it.
+  draft: true
+  replace_existing_draft: true
   extra_files:
     - glob: "terraform-registry-manifest.json"
       name_template: "{{ .ProjectName }}_{{ .Version }}_manifest.json"
