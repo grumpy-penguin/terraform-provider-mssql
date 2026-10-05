@@ -72,8 +72,8 @@ func (p *MssqlProvider) Metadata(_ context.Context, _ provider.MetadataRequest, 
 
 func (p *MssqlProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Maps Azure AD (Entra ID) identities to Azure SQL Database users and manages their database role memberships. Connects to the database as an Azure AD App Registration, either via a client secret or, for CI/CD pipelines, via OIDC workload identity federation (use_oidc). " +
-			"Whichever identity is used must be the SQL Server's Azure AD Administrator (set at server creation, or added afterwards) — that's what grants it permission to run CREATE USER ... FROM EXTERNAL PROVIDER and manage role membership; see the provider README for setup guidance.",
+		Description: "Maps Azure AD (Entra ID) identities to Azure SQL Database users, manages their database role memberships, and creates custom database roles with their permissions. Connects to the database as an Azure AD App Registration, either via a client secret or, for CI/CD pipelines, via OIDC workload identity federation (use_oidc). " +
+			"Whichever identity is used must be the SQL Server's Azure AD Administrator (set at server creation, or added afterwards) — that's what grants it permission to run CREATE USER ... FROM EXTERNAL PROVIDER, CREATE ROLE and GRANT, and manage role membership; see the provider README for setup guidance.",
 		Attributes: map[string]schema.Attribute{
 			"tenant_id": schema.StringAttribute{
 				Optional:    true,
@@ -201,6 +201,7 @@ func (p *MssqlProvider) Configure(ctx context.Context, req provider.ConfigureReq
 func (p *MssqlProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewUserResource,
+		NewRoleResource,
 	}
 }
 

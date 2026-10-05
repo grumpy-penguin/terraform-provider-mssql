@@ -1,8 +1,9 @@
 # terraform-provider-mssql
 
 A Terraform provider that maps Azure AD (Entra ID) identities to Azure SQL
-Database users, and manages which database roles each mapped user belongs
-to.
+Database users, manages which database roles each mapped user belongs
+to, and creates the custom roles (and their permissions) they're mapped
+into.
 
 The provider connects to the database as an Azure AD App Registration —
 no SQL auth username/password is ever used. Two authentication modes are
@@ -29,9 +30,18 @@ Given an Azure AD user or group and a list of database roles, the
    `roles` list — adding missing memberships (`ALTER ROLE ... ADD MEMBER`)
    and revoking ones no longer listed (`ALTER ROLE ... DROP MEMBER`).
 
-Roles themselves (built-in like `db_datareader`, or custom roles) are
-expected to already exist in the database; this resource maps users into
-them but does not create or own roles.
+`mssql_user` maps users into roles but doesn't create them. Built-in
+roles like `db_datareader` always exist; custom roles can be created in
+the same configuration with [`mssql_role`](#resource-mssql_role), which:
+
+1. Creates the role (`CREATE ROLE [name]`) if it doesn't already exist,
+   adopting an existing custom role of the same name.
+2. Reconciles the role's permissions to exactly match its `permissions`
+   set — granting missing ones (`GRANT ... TO`) and revoking ones no
+   longer listed (`REVOKE ... FROM ... CASCADE`).
+
+This covers permissions no fixed role grants, most commonly `EXECUTE` for
+an application identity that only calls stored procedures.
 
 ### Idempotency
 
@@ -94,7 +104,7 @@ connection pool rather than each opening their own.
 - An Azure AD App Registration that is the **Azure AD Administrator** of
   the target Azure SQL logical server. This is not optional: a database
   principal only gets permission to run `CREATE USER ... FROM EXTERNAL
-  PROVIDER` and `ALTER ROLE` if it's the server's AAD admin (or has been
+  PROVIDER`, `CREATE ROLE`, `GRANT` and `ALTER ROLE` if it's the server's AAD admin (or has been
   separately granted equivalent rights by that admin). See
   [Prerequisite: the connecting identity must be the server's Azure AD
   Administrator](#prerequisite-the-connecting-identity-must-be-the-servers-azure-ad-administrator).
@@ -327,6 +337,59 @@ pipeline provides:
 | `database`  | if not set on the provider             | yes            | Target database. Overrides the provider's `database`.                                           |
 | `roles`     | yes                                    | no             | Set of database role names this user should belong to.                                          |
 
+## Resource: `mssql_role`
+
+| Argument      | Required                   | Force replace | Description                                                                                                  |
+| ------------- | -------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------ |
+| `name`        | yes                        | yes           | Custom role name, e.g. `db_executor`. Fixed roles (`db_owner`, `db_datareader`, ...) and `public` are refused. |
+| `server`      | if not set on the provider | yes           | Azure SQL logical server FQDN. Overrides the provider's `server`.                                           |
+| `database`    | if not set on the provider | yes           | Target database. Overrides the provider's `database`.                                                       |
+| `permissions` | no (defaults to none)      | no            | Set of `{ permission, class, securable }` grants, reconciled exactly.                                         |
+
+Each `permissions` entry:
+
+| Field        | Description                                                                                                      |
+| ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `permission` | Upper-case T-SQL permission name: `EXECUTE`, `SELECT`, `VIEW DEFINITION`, ...                                     |
+| `class`      | `DATABASE`, `SCHEMA`, `OBJECT` or `TYPE`.                                                                         |
+| `securable`  | Omit for `DATABASE`; a schema name for `SCHEMA`; `<schema>.<name>` for `OBJECT` and `TYPE`.                        |
+
+```hcl
+resource "mssql_role" "executor" {
+  server   = "myserver.database.windows.net"
+  database = "mydatabase"
+  name     = "db_executor"
+
+  permissions = [
+    { permission = "EXECUTE", class = "SCHEMA", securable = "dbo" },
+    { permission = "EXECUTE", class = "TYPE", securable = "dbo.PhoneEntryIdTVP" },
+  ]
+}
+
+resource "mssql_user" "api" {
+  server    = "myserver.database.windows.net"
+  database  = "mydatabase"
+  user_name = "my-api-managed-identity"
+
+  # Referencing the role's name (rather than the literal string) makes
+  # Terraform create the role before adding the user to it.
+  roles = [
+    mssql_role.executor.name,
+  ]
+}
+```
+
+Notes:
+
+- Only `GRANT`s are managed. `DENY`s and column-level grants on the role
+  are ignored, so they never show as drift.
+- A permission granted on a schema, object or type that doesn't exist
+  fails the apply. If a schema is created by a later database deployment,
+  add it here only after that.
+- Deleting the resource removes the role's members, then drops the role
+  (its permissions go with it).
+- Import with `terraform import mssql_role.executor <server>/<database>/<name>`.
+
 ## Releasing
 
 Terraform never builds a provider from source — `terraform init` only
@@ -384,7 +447,8 @@ go test ./...
 ```
 
 Unit tests cover the pure logic (identifier quoting, SQL error
-classification, role-membership diffing, OIDC token handling,
+classification, role-membership and permission diffing, GRANT/REVOKE
+statement building and validation, OIDC token handling,
 provider/resource target-resolution precedence). Exercising CRUD against
 a real Azure SQL Database requires live credentials and is not part of
 the test suite.

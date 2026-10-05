@@ -51,7 +51,7 @@ func (r *UserResource) Metadata(_ context.Context, req resource.MetadataRequest,
 
 func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "Maps an Azure AD user or group to an Azure SQL Database user (CREATE USER ... FROM EXTERNAL PROVIDER) and manages the set of database roles it is a member of. Roles must already exist in the database; this resource does not create them.",
+		Description: "Maps an Azure AD user or group to an Azure SQL Database user (CREATE USER ... FROM EXTERNAL PROVIDER) and manages the set of database roles it is a member of. Roles must already exist in the database; this resource does not create them (create custom ones with mssql_role).",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:      true,
@@ -83,7 +83,7 @@ func (r *UserResource) Schema(_ context.Context, _ resource.SchemaRequest, resp 
 			"roles": schema.SetAttribute{
 				Required:    true,
 				ElementType: types.StringType,
-				Description: "Database roles this user should be a member of, e.g. [\"db_datareader\", \"db_datawriter\"]. Reconciled exactly: roles removed from this list are revoked from the user. Roles must already exist in the database.",
+				Description: "Database roles this user should be a member of, e.g. [\"db_datareader\", \"db_datawriter\"]. Reconciled exactly: roles removed from this list are revoked from the user. Roles must already exist in the database; reference an mssql_role's name here so Terraform creates the role first.",
 			},
 		},
 	}
@@ -108,23 +108,7 @@ func (r *UserResource) Configure(_ context.Context, req resource.ConfigureReques
 // should connect to: its own server/database if set, otherwise the
 // provider's defaults. Returns an error if neither source supplies one.
 func (r *UserResource) resolveTarget(model userResourceModel) (sqlclient.Target, error) {
-	server := model.Server.ValueString()
-	if server == "" {
-		server = r.defaultServer
-	}
-	if server == "" {
-		return sqlclient.Target{}, fmt.Errorf("no server configured: set server on the mssql_user resource or on the mssql provider")
-	}
-
-	database := model.Database.ValueString()
-	if database == "" {
-		database = r.defaultDatabase
-	}
-	if database == "" {
-		return sqlclient.Target{}, fmt.Errorf("no database configured: set database on the mssql_user resource or on the mssql provider")
-	}
-
-	return sqlclient.Target{Server: server, Port: r.defaultPort, Database: database}, nil
+	return resolveTarget("mssql_user", model.Server.ValueString(), model.Database.ValueString(), r.defaultServer, r.defaultPort, r.defaultDatabase)
 }
 
 func (r *UserResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
