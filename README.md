@@ -48,6 +48,15 @@ an application identity that only calls stored procedures.
 - `Create` checks for an existing principal before issuing `CREATE USER`,
   and treats a duplicate-object error as success (safe under concurrent
   applies).
+- An identity created in the same apply (typically a user-assigned
+  managed identity) can take a minute or two to become visible to Azure
+  SQL's Entra ID lookup. Until it does, `CREATE USER ... FROM EXTERNAL
+  PROVIDER` fails with error 33130, "Principal '...' could not be found or
+  this principal type is not supported". `Create` retries that error with
+  backoff (5s, 10s, 20s, then every 30s) for up to 5 minutes, so no
+  `time_sleep` is needed between the identity and the `mssql_user`. Any
+  other error, or 33130 lasting past 5 minutes (a misspelt name, the wrong
+  tenant), fails the apply as before.
 - `Read` always re-derives state from `sys.database_principals` /
   `sys.database_role_members`, so drift (e.g. someone manually revoking a
   role) shows up as a plan diff instead of being silently ignored.

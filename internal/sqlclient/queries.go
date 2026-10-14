@@ -56,8 +56,15 @@ func (c *Client) EnsureExternalUser(ctx context.Context, userName string) error 
 		return nil // already mapped, nothing to do
 	}
 
+	// A just-created Entra ID identity can take a minute or two to become visible to SQL's
+	// directory lookup, so "principal not found" is retried with backoff before it's treated as
+	// an error (see principalPropagationRetry).
 	stmt := fmt.Sprintf(`CREATE USER %s FROM EXTERNAL PROVIDER`, quoteIdentifier(userName))
-	if _, err := c.db.ExecContext(ctx, stmt); err != nil {
+	err = principalPropagationRetry.do(ctx, IsPrincipalNotFound, func(ctx context.Context) error {
+		_, execErr := c.db.ExecContext(ctx, stmt)
+		return execErr
+	})
+	if err != nil {
 		if IsUniqueViolation(err) {
 			return nil // created concurrently by another apply; treat as success
 		}
